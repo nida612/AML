@@ -4,15 +4,18 @@ import glob
 import os
 import shutil
 
+import PIL.Image as Image
+import PIL.ImageDraw as ImageDraw
+import PIL.ImageFont as ImageFont
 import albumentations
 import joblib
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pretrainedmodels
 import sklearn
 import torch
 import torch.nn as nn
-from PIL import Image
 from efficientnet_pytorch import EfficientNet
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold
 from torch.nn import functional as F
@@ -39,7 +42,7 @@ MODEL_STD = ast.literal_eval("(0.229, 0.224, 0.225)")
 CUDA_VISIBLE_DEVICES = 1
 IMG_HEIGHT = 137
 IMG_WIDTH = 236
-EPOCHS = 50
+EPOCHS = 100
 TRAIN_BATCH_SIZE = 128
 TEST_BATCH_SIZE = 32
 
@@ -153,9 +156,9 @@ class EfficientNetB3(nn.Module):
         self.effNet = EfficientNet.from_name('efficientnet-b3')
 
         # based on input images
-        self.fc_root = nn.Linear(in_features=1000, out_features=168)
-        self.fc_vowel = nn.Linear(in_features=1000, out_features=11)
-        self.fc_consonant = nn.Linear(in_features=1000, out_features=7)
+        self.fc_root = nn.Linear(in_features=512, out_features=168)
+        self.fc_vowel = nn.Linear(in_features=512, out_features=11)
+        self.fc_consonant = nn.Linear(in_features=512, out_features=7)
 
     def forward(self, X):
         output = self.effNet(X)
@@ -424,8 +427,6 @@ def should_stop_training_early(val_score, model, early_stopping):
 
 
 def save_plots(train_scores, valid_data_scores, train_losses, valid_data_losses, plot_prefix):
-    import matplotlib.pyplot as plt
-
     # accuracy plots
     plt.figure(figsize=(10, 7))
     plt.plot(
@@ -434,12 +435,12 @@ def save_plots(train_scores, valid_data_scores, train_losses, valid_data_losses,
     )
     plt.plot(
         valid_data_scores, color='blue', linestyle='-',
-        label='validataion accuracy'
+        label='validation accuracy'
     )
     plt.xlabel('Epochs')
     plt.ylabel('Accuracy')
     plt.legend()
-    plt.savefig(f'{plot_prefix}accuracy.png')
+    plt.savefig(f'{plot_prefix}_accuracy.png')
 
     # loss plots
     plt.figure(figsize=(10, 7))
@@ -449,15 +450,16 @@ def save_plots(train_scores, valid_data_scores, train_losses, valid_data_losses,
     )
     plt.plot(
         valid_data_losses, color='red', linestyle='-',
-        label='validataion loss'
+        label='validation loss'
     )
     plt.xlabel('Epochs')
     plt.ylabel('Loss')
     plt.legend()
-    plt.savefig(f'{plot_prefix}loss.png')
+    plt.savefig(f'{plot_prefix}_loss.png')
+
 
 # plotting collected data
-def plots(data_collector):
+def plots(data_collector, base_model):
     for i in data_collector:
         print(f"plotting for valid fold:{i}")
         i_data = i['data']
@@ -473,7 +475,7 @@ def plots(data_collector):
             valid_data_losses.append(entry['valid_data_loss'])
             valid_data_scores.append(entry['valid_data_score'])
 
-        save_plots(train_scores, valid_data_scores, train_losses, valid_data_losses, f'valid_fold_{i}')
+        save_plots(train_scores, valid_data_scores, train_losses, valid_data_losses, f'{base_model}_valid_fold_{i}')
 
 
 def train_main(base_model):
@@ -504,7 +506,8 @@ def train_main(base_model):
         for epoch in range(EPOCHS):
             train_loss, train_score = train(train_dataset, device, train_loader, model, optimizer)
             valid_data_loss, valid_data_score = evaluate(valid_dataset, device, valid_loader, model)
-            scheduler.step(valid_data_score)
+            if scheduler:
+                scheduler.step(valid_data_score)
 
             # check and update top_score if valid_data_score is better
             if valid_data_score > top_score_so_far:
@@ -524,15 +527,14 @@ def train_main(base_model):
                 print("Early stopping")
                 break
         top_level_data_collector.append({"valid_fold": valid_fold, "data": data_collector})
-    plots(top_level_data_collector)
+    plots(top_level_data_collector, base_model)
 
 
 def setup_model(model):
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.3,
-                                                           verbose=True)
+    # scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5, factor=0.3, verbose=True)
     early_stopping = EarlyStopping(patience=5, verbose=True)
-    return early_stopping, optimizer, scheduler
+    return early_stopping, optimizer, None
 
 
 def get_train_data_loaders(TRAIN_FOLDS, VALID_FOLDS):
@@ -629,11 +631,38 @@ def create_submission_csv(final_c_pred, final_g_pred, final_img_ids, final_v_pre
     submission.to_csv("submission.csv", index=False)
 
 
+def load_as_npa(file):
+    print(f'loading file {file}')
+    df = pd.read_parquet(file)
+    print(df.head(10))
+    return df.iloc[:, 0], df.iloc[:, 1:].values.reshape(-1, IMG_HEIGHT, IMG_WIDTH)
+
+
+def image_from_char(char):
+    image = Image.new('RGB', (IMG_WIDTH, IMG_HEIGHT))
+    draw = ImageDraw.Draw(image)
+    myfont = ImageFont.truetype(f'{INPUT_FOLDER}font.ttf', 120)
+    w, h = draw.textsize(char, font=myfont)
+    draw.text(((IMG_WIDTH - w) / 2, (IMG_HEIGHT - h) / 2), char, font=myfont)
+
+    return image
+
+
+def sample_train_images():
+    image_ids0, images0 = load_as_npa(f'{INPUT_FOLDER}train_image_data_0.parquet')
+    f, ax = plt.subplots(5, 5, figsize=(16, 8))
+    ax = ax.flatten()
+
+    for i in range(25):
+        ax[i].imshow(images0[i], cmap='Greys')
+
+
 if __name__ == '__main__':
     my_parser = argparse.ArgumentParser(description='Operation to perform')
     my_parser.add_argument('-op',
                            type=str,
-                           help="Operation to perform", required=True, choices=['preprocess', 'train', 'test'])
+                           help="Operation to perform", required=True,
+                           choices=['preprocess', 'train', 'test', "sample_images"])
     my_parser.add_argument('-m',
                            type=str,
                            help="base model to use", required=False, choices=[RESNET, EFFNET])
@@ -642,6 +671,8 @@ if __name__ == '__main__':
         preprocess_input_data()
     elif args.op == 'train':
         train_main(args.m)
-    else:
+    elif args.op == 'test':
         test(args.m)
+    else:
+        sample_train_images()
     print("DONE!!!")
